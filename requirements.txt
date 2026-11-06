@@ -2,3 +2,4 @@ streamlit
 mcp
 httpx
 google-genai
+nest_asyncio

@@ -2,11 +2,15 @@ import asyncio
 import os
 import sys
 from pathlib import Path
+import nest_asyncio
 import streamlit as st
 from google import genai
 from google.genai import types
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+
+# Patch asyncio to handle Streamlit's internal loop
+nest_asyncio.apply()
 
 st.set_page_config(
     page_title="MCP DevOps Assistant - Live Demo",
@@ -20,11 +24,10 @@ st.caption(
     "over stdio, integrated with Google Gemini function calling."
 )
 
-# 1. API Key resolution (reads from Streamlit Secrets or manual input)
+# 1. API Key resolution (Streamlit Secrets -> Environment -> Sidebar input)
 api_key = os.environ.get("GEMINI_API_KEY")
-if not api_key:
-    if "GEMINI_API_KEY" in st.secrets:
-        api_key = st.secrets["GEMINI_API_KEY"]
+if not api_key and "GEMINI_API_KEY" in st.secrets:
+    api_key = st.secrets["GEMINI_API_KEY"]
 
 if not api_key:
     with st.sidebar:
@@ -37,10 +40,14 @@ async def run_mcp_agent(query: str, key: str):
     current_dir = Path(__file__).parent.resolve()
     server_script = str(current_dir / "server.py")
 
+    # Pass complete environment so the child process finds all dependencies
+    sub_env = os.environ.copy()
+    sub_env["PYTHONUNBUFFERED"] = "1"
+
     server_params = StdioServerParameters(
         command=sys.executable,
         args=[server_script],
-        env=dict(os.environ),
+        env=sub_env,
     )
 
     client = genai.Client(api_key=key)
@@ -106,6 +113,15 @@ async def run_mcp_agent(query: str, key: str):
             else:
                 return None, response.text
 
+# Helper to run async task safely within Streamlit
+def execute_coroutine(coro):
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop.run_until_complete(coro)
+
 # 3. Interactive UI
 default_prompts = [
     "Can you check the GitHub stats for psf/requests and summarize its community health?",
@@ -122,9 +138,8 @@ if st.button("Run Agent Query", type="primary"):
     else:
         with st.spinner("Connecting to MCP server via stdio and querying Gemini..."):
             try:
-                tool_event, final_text = asyncio.run(run_mcp_agent(custom_query, api_key))
+                tool_event, final_text = execute_coroutine(run_mcp_agent(custom_query, api_key))
 
-                # Display tool execution breakdown
                 if tool_event:
                     with st.expander("🔍 MCP Tool Handshake & Invocation", expanded=True):
                         st.markdown(f"**Tool Called:** `{tool_event['tool_name']}`")
@@ -136,4 +151,9 @@ if st.button("Run Agent Query", type="primary"):
                 st.markdown(final_text)
 
             except Exception as ex:
-                st.error(f"Execution Error: {str(ex)}")
+                # Unpack ExceptionGroup / TaskGroup errors if present to show the true root cause
+                err_msg = str(ex)
+                if hasattr(ex, "exceptions"):
+                    sub_errors = "\n".join([f"- {type(e).__name__}: {e}" for e in ex.exceptions])
+                    err_msg = f"{err_msg}\n\n**Sub-exceptions:**\n{sub_errors}"
+                st.error(f"Execution Error: {err_msg}")
